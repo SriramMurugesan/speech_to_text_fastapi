@@ -1,102 +1,83 @@
 import asyncio
-import os
 import logging
+import numpy as np
+import soundfile as sf
+from faster_whisper import WhisperModel
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from amazon_transcribe.client import TranscribeStreamingClient
-from amazon_transcribe.handlers import TranscriptResultStreamHandler
-from amazon_transcribe.model import TranscriptEvent
-
+from typing import Optional
 
 app = FastAPI()
+
+# Load Whisper model (medium or small model is recommended)
+model = WhisperModel("small", device="cpu", compute_type="int8")
 
 @app.websocket("/TranscribeStreaming")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    websocket_open = True
-    stop_audio_stream = False  # Flag to indicate when to stop the audio stream
-    audio_queue = asyncio.Queue()  # Queue for incoming audio data
-
-    class MyEventHandler(TranscriptResultStreamHandler):
-        def __init__(self, output_stream, websocket):
-            super().__init__(output_stream)
-            self.websocket = websocket
-            self.final_transcript = ""
-
-        async def handle_transcript_event(self, transcript_event: TranscriptEvent):
-            if websocket_open:  # Check WebSocket state
-                results = transcript_event.transcript.results
-                for result in results:
-                    if result.is_partial:
-                        continue
-                    for alt in result.alternatives:
-                        print(alt.transcript)
-                        self.final_transcript += alt.transcript + " "
-                        await self.websocket.send_text(alt.transcript)
-
-        async def send_final_transcript(self):
-            if websocket_open:  # Check WebSocket state
-                await self.websocket.send_text(f"Final Transcript: {self.final_transcript.strip()}")
+    audio_queue: asyncio.Queue = asyncio.Queue()
+    audio_chunks = []
+    is_connected = True
 
     async def mic_stream():
-        while True:
-            indata = await audio_queue.get()
-            if stop_audio_stream:
-                break
-            yield indata, None
-
-    async def write_chunks(stream):
-        async for chunk, _ in mic_stream():
+        while is_connected:
             try:
-                await stream.input_stream.send_audio_event(audio_chunk=chunk)
-            except OSError as e:
-                logging.error(f"OSError: {e}")
+                indata = await audio_queue.get()
+                if indata is None:
+                    break
+                yield np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
+            except Exception as e:
+                logging.error(f"Error in mic_stream: {e}")
                 break
-        await stream.input_stream.end_stream()
 
-    handler = None  # Initialize handler
+    async def process_audio():
+        try:
+            async for chunk in mic_stream():
+                if not is_connected:
+                    break
+                audio_chunks.append(chunk)
+                if len(audio_chunks) >= 5:  # Process every 5 chunks
+                    audio_data = np.concatenate(audio_chunks)
+                    sf.write("temp_audio.wav", audio_data, 16000)
+                    segments, _ = model.transcribe("temp_audio.wav")
+                    transcript = " ".join(segment.text for segment in segments)
+                    if is_connected:
+                        await websocket.send_text(transcript)
+                    audio_chunks.clear()
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logging.error(f"Error in process_audio: {e}")
+
+    audio_task = asyncio.create_task(process_audio())
 
     try:
-        region = os.getenv("AWS_REGION", "us-east-2")
-
-        client = TranscribeStreamingClient(region=region)
-
-        stream = await client.start_stream_transcription(
-            language_code="en-US",
-            media_sample_rate_hz=16000,
-            media_encoding="pcm",
-        )
-
-        handler = MyEventHandler(stream.output_stream, websocket)
-        send_task = asyncio.create_task(write_chunks(stream))
-        handle_task = asyncio.create_task(handler.handle_events())
-
         while True:
-            message = await websocket.receive()
-            if message["type"] == "websocket.receive":
+            try:
+                message = await websocket.receive()
                 if "bytes" in message:
-                    audio_chunk = message["bytes"]
-                    await audio_queue.put(audio_chunk)
-                elif "text" in message:
-                    text_message = message["text"]
-                    logging.info(f"Received message: {text_message}")  # Log received message
-                    if text_message == "submit_response":
-                        print("received:", "submit_response")
-                        stop_audio_stream = True  # Signal to stop the audio stream
-                        await send_task  # Wait for the audio stream to finish gracefully
-                        break
-
-        await handler.send_final_transcript()
-
+                    await audio_queue.put(message["bytes"])
+                elif "text" in message and message["text"] == "submit_response":
+                    # Process any remaining chunks
+                    if audio_chunks:
+                        audio_data = np.concatenate(audio_chunks)
+                        sf.write("temp_audio.wav", audio_data, 16000)
+                        segments, _ = model.transcribe("temp_audio.wav")
+                        transcript = " ".join(segment.text for segment in segments)
+                        await websocket.send_text(transcript)
+                    break
+            except RuntimeError as e:
+                if "disconnect message has been received" in str(e):
+                    break
+                raise
     except WebSocketDisconnect:
         logging.info("WebSocket disconnected")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-
     finally:
-        websocket_open = False  # Update WebSocket state
-        if handler:
-            await handler.send_final_transcript()  # Ensure final transcript is sent in all cases
-        await websocket.close()
+        is_connected = False
+        await audio_queue.put(None)  # Signal mic_stream to stop
+        try:
+            await audio_task
+        except Exception as e:
+            logging.error(f"Error while cleaning up audio task: {e}")
 
 if __name__ == "__main__":
     import uvicorn
